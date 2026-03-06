@@ -461,7 +461,7 @@ fn render_pin_popup(f: &mut Frame, state: &UiState) {
     f.render_widget(block, area);
 
     let text = format!(
-        "PIN: {}\n\nEnter the 4-digit code shown on the device.\nPress Enter to submit, Esc to cancel.",
+        "PIN: {}\n\nCheck your iPhone/iPad for a HomeKit pairing notification.\nEnter the 4-digit code, then press Enter. Esc to cancel.",
         state.pin_input
     );
     f.render_widget(

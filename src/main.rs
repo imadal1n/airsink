@@ -3,6 +3,7 @@
 //! This binary wires together the application supervisor and terminal user interface,
 //! providing a complete AirPlay 2 streaming solution from Linux to Apple devices.
 
+use std::fs::File;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -10,6 +11,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::writer::MakeWriterExt;
 
 use airsink::{App, Config};
 
@@ -43,12 +45,15 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Initialize tracing subscriber with environment filter.
-    // Respects RUST_LOG environment variable, defaults to "info" level.
+    // Initialize tracing subscriber writing to /tmp/airsink.log.
+    // Respects RUST_LOG environment variable, defaults to "debug" level.
+    let log_file = File::create("/tmp/airsink.log").expect("failed to create log file");
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")),
         )
+        .with_writer(log_file.with_max_level(tracing::Level::TRACE))
+        .with_ansi(false)
         .init();
 
     // Parse optional bind IP from CLI argument.

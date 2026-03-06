@@ -1,24 +1,29 @@
 //! Application command and handle contracts shared by UI and supervisor layers.
 
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::io::AsyncReadExt;
+use tokio::net::TcpStream;
 use tokio::select;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{self, Sleep};
-use tracing::{error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, PairingStore};
 use crate::core::{AppModel, ConnState, Device, DeviceId, PcmFormat, SampleFormat};
+use crate::crypto::SessionKeys;
 use crate::discovery::{DeviceEvent, start_discovery};
 use crate::error::{Error, Recoverability, Result};
 use crate::hap::HapClient;
 use crate::pipewire::{CaptureHandle, VirtualSinkSpec};
-use crate::rtp::{RtpSender, StreamPipeline};
+use crate::rtp::{RtpSender, StreamPipeline, SyncSender};
 use crate::rtsp::{AudioStreamConfig, RtspClient};
 use crate::timing::TimingServer;
+use crate::timing::ptp::{PtpConfig, PtpMaster, PtpSockets};
 
 /// User- or system-issued intents consumed by the application supervisor.
 #[derive(Debug, Clone, PartialEq)]
@@ -89,6 +94,7 @@ enum SessionTaskKind {
     Timing,
     Pipeline,
     Keepalive,
+    Event,
 }
 
 #[derive(Debug)]
@@ -104,9 +110,12 @@ struct ActiveSession {
     rtsp: Arc<tokio::sync::Mutex<RtspClient>>,
     stop_tx: watch::Sender<bool>,
     capture_stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    ptp_master: Option<Arc<PtpMaster>>,
+    ptp_join: Option<JoinHandle<()>>,
     timing_join: JoinHandle<()>,
     pipeline_join: JoinHandle<()>,
     keepalive_join: JoinHandle<()>,
+    event_join: Option<JoinHandle<()>>,
 }
 
 struct ReconnectPlan {
@@ -223,7 +232,9 @@ impl Supervisor {
             Command::StartStreaming => {
                 self.clear_reconnect();
                 if let Some(device) = self.selected_device.clone() {
+                    info!(device_name = %device.name, device_id = %device.id.0, "StartStreaming command received");
                     if let Err(err) = self.ensure_streaming(device).await {
+                        error!(error = %err, "ensure_streaming failed");
                         self.handle_session_error(err).await;
                     }
                 } else {
@@ -335,31 +346,64 @@ impl Supervisor {
         self.stop_session().await;
         self.selected_device = Some(device.clone());
 
+        // Try stored credentials first (fast reconnect).
         let creds = self.store.load(&device.id).await?;
-        if creds.is_none() {
-            self.transition_state(ConnState::Pairing { device });
+        if let Some(creds) = creds {
+            info!("found stored credentials, starting verified session");
+            let session = self.start_session_with_creds(device.clone(), creds).await?;
+            self.active_session = Some(session);
+            self.selected_device = Some(device);
             return Ok(());
         }
 
-        let creds = creds.expect("checked is_some");
-        let session = self.start_session(device.clone(), creds).await?;
-        self.active_session = Some(session);
-        self.selected_device = Some(device);
-        Ok(())
+        // Always attempt transient pairing first (no PIN needed).
+        info!(device_name = %device.name, "attempting transient pairing (PIN 3939)");
+        self.transition_state(ConnState::Pairing {
+            device: device.clone(),
+        });
+        match self.try_transient_pairing(&device).await {
+            Ok((session_keys, stream, leftover)) => {
+                info!("transient pairing succeeded");
+                let session = self
+                    .start_session(device.clone(), session_keys, stream, &leftover)
+                    .await?;
+                self.active_session = Some(session);
+                self.selected_device = Some(device);
+                Ok(())
+            }
+            Err(err) => {
+                warn!(error = %err, "transient pairing failed, falling back to PIN-based pairing");
+                self.transition_state(ConnState::Pairing { device });
+                Ok(())
+            }
+        }
+    }
+
+    async fn try_transient_pairing(
+        &self,
+        device: &Device,
+    ) -> Result<(SessionKeys, TcpStream, Vec<u8>)> {
+        let mut hap = HapClient::connect(device).await?;
+        let keys = hap.pair_setup_transient().await?;
+        let (stream, leftover) = hap.into_parts();
+        Ok((keys, stream, leftover))
     }
 
     async fn pair_and_stream(&mut self, device: Device, pin: String) -> Result<()> {
+        info!(device_name = %device.name, host = %device.host, port = device.port_rtsp, "connecting HAP client for pair-setup");
         let mut hap = HapClient::connect(&device).await?;
+        info!("HAP connected, starting pair-setup with PIN");
         let creds = hap.pair_setup(&pin).await?;
+        info!("pair-setup succeeded, saving credentials");
         self.store.save(&device.id, &creds).await?;
 
-        let session = self.start_session(device.clone(), creds).await?;
+        let session = self.start_session_with_creds(device.clone(), creds).await?;
         self.active_session = Some(session);
         self.selected_device = Some(device);
         Ok(())
     }
 
-    async fn start_session(
+    async fn start_session_with_creds(
         &mut self,
         device: Device,
         creds: crate::config::PairingCredentials,
@@ -370,32 +414,166 @@ impl Supervisor {
 
         let mut hap = HapClient::connect(&device).await?;
         let session_keys = hap.pair_verify(&creds).await?;
+        let (stream, leftover) = hap.into_parts();
 
+        self.start_session(device, session_keys, stream, &leftover)
+            .await
+    }
+
+    async fn start_session(
+        &mut self,
+        device: Device,
+        session_keys: SessionKeys,
+        stream: TcpStream,
+        leftover: &[u8],
+    ) -> Result<ActiveSession> {
         self.transition_state(ConnState::Connecting {
             device: device.clone(),
         });
 
+        debug!("start_session: starting timing server");
         let (timing_server, timing_port) = TimingServer::start(0).await?;
+        debug!(timing_port, "start_session: timing server bound");
 
-        let mut rtsp = RtspClient::connect(&device).await?;
+        debug!("start_session: reusing paired TCP connection for RTSP");
+        let mut rtsp = RtspClient::from_parts(stream, leftover, &device);
+        debug!("start_session: setting encryption on RTSP");
         rtsp.set_encryption(session_keys.clone());
 
+        debug!("start_session: sending GET /info");
+        let info = rtsp.get_info().await?;
+        debug!(
+            num_keys = info.len(),
+            "start_session: /info response received"
+        );
+
+        debug!("start_session: binding PTP sockets");
+        let ptp_sockets = PtpSockets::bind().await?;
+        let our_ptp_port = ptp_sockets.event_port;
+        debug!(our_ptp_port, "start_session: PTP sockets bound");
+
         let session_uuid = random_session_uuid();
-        rtsp.setup_session(&session_uuid, timing_port).await?;
+        let sender_device_id = random_sender_device_id();
+        let sender_mac = random_sender_device_id();
+        let group_uuid = random_session_uuid();
+        debug!(
+            session_uuid,
+            sender_device_id, "start_session: sending RTSP setup_session (PTP)"
+        );
+        let (setup_resp, ptp_clock_id) = rtsp
+            .setup_session(
+                &session_uuid,
+                timing_port,
+                &sender_device_id,
+                &sender_mac,
+                &group_uuid,
+                true,
+                our_ptp_port,
+            )
+            .await?;
+        debug!("start_session: RTSP session created");
+
+        for (key, val) in &setup_resp {
+            let val_summary = match val {
+                plist::Value::String(s) => s.clone(),
+                plist::Value::Integer(i) => format!("{i:?}"),
+                plist::Value::Boolean(b) => format!("{b}"),
+                _ => format!("{val:?}"),
+            };
+            debug!(key, val = %val_summary, "setup_session response field");
+        }
+
+        let peer_clock_port = 0_u16;
+
+        let event_port = setup_resp
+            .get("eventPort")
+            .and_then(|v| v.as_unsigned_integer().map(|p| p as u16)
+                .or_else(|| v.as_signed_integer().map(|p| p as u16)))
+            .unwrap_or(0);
+
+        let event_channel = if event_port > 0 {
+            debug!(event_port, "connecting to event channel");
+            let stream = TcpStream::connect((device.host, event_port))
+                .await
+                .map_err(|e| Error::Network(format!("event channel connect: {e}")))?;
+            debug!("event channel connected");
+            Some(stream)
+        } else {
+            warn!("no eventPort in SETUP response");
+            None
+        };
+
+        let ptp_config = PtpConfig {
+            clock_id: ptp_clock_id,
+            peer_addr: device.host,
+            peer_clock_port,
+        };
+        debug!(
+            clock_id = ptp_clock_id,
+            peer_clock_port, "starting PTP follower"
+        );
+        let ptp_master = PtpMaster::start(ptp_config, ptp_sockets).await?;
+        let (ptp_master, ptp_join) = ptp_master;
+
+        let initial_seq: u16 = rand::random();
+        let initial_rtptime: u32 = rand::random();
+
+        debug!("start_session: sending RECORD");
+        rtsp.record(initial_seq, initial_rtptime).await?;
+        debug!("start_session: RECORD accepted");
+
+        debug!("start_session: sending SETPEERS");
+        let remote_ip = device.host.to_string();
+        rtsp.setpeers(&remote_ip).await?;
+        debug!("start_session: SETPEERS accepted");
+
+        let control_socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
+            .await
+            .map_err(|err| Error::Network(format!("failed to bind control socket: {err}")))?;
+        let local_control_port = control_socket
+            .local_addr()
+            .map_err(|err| Error::Network(format!("failed to read control socket address: {err}")))?
+            .port();
+        debug!(local_control_port, "start_session: control socket bound");
+
+        // We need a temporary encoder to get the magic cookie for SETUP
+        let temp_encoder = crate::codec::new_encoder(
+            PcmFormat { rate_hz: 44100, channels: 2, sample: SampleFormat::S16LE },
+            352,
+            initial_rtptime
+        )?;
+        let asc = temp_encoder.magic_cookie().map(|b| b.to_vec());
 
         let stream_config = AudioStreamConfig {
             stream_type: 0x60,
-            audio_format: 0x800,
-            ct: 1,
+            audio_format: 0x40000,
+            ct: 2,
             spf: 352,
             sr: 44_100,
+            asc,
             shk: session_keys.audio.key.to_vec(),
-            control_port: device.port_control.unwrap_or(0),
-            latency_min: self.cfg.target_latency_ms,
-            latency_max: self.cfg.target_latency_ms,
+            control_port: local_control_port,
+            latency_min: 11_025,
+            latency_max: 88_200,
             stream_connection_id: rand::random::<u64>(),
         };
+        debug!("start_session: sending RTSP setup_audio_stream");
         let stream_ports = rtsp.setup_audio_stream(&stream_config).await?;
+        debug!(?stream_ports, "start_session: audio stream ports received");
+
+        let sync_sender = SyncSender::new(
+            control_socket,
+            SocketAddr::new(device.host, stream_ports.control_port),
+            ptp_clock_id as u64,
+        );
+
+        let lock_timeout = Duration::from_secs(15);
+        let ptp_locked = ptp_master.wait_locked(lock_timeout).await;
+        if ptp_locked {
+            debug!("start_session: PTP clock locked");
+        } else {
+            warn!("start_session: PTP clock not locked after {lock_timeout:?}, continuing anyway");
+        }
 
         let capture_spec = VirtualSinkSpec {
             name: self.cfg.virtual_sink_name.clone(),
@@ -409,8 +587,9 @@ impl Supervisor {
         let CaptureHandle { pcm_rx, stop_tx } = crate::pipewire::start_capture(capture_spec)?;
 
         let sender = RtpSender::new(device.host, stream_ports.data_port, self.cfg.bind_ip).await?;
-        rtsp.record(0, session_keys.base_rtp_timestamp).await?;
         rtsp.set_volume(volume_to_db(self.model.volume)).await?;
+
+        let ptp_master = Arc::new(ptp_master);
 
         self.transition_state(ConnState::Connected {
             device: device.clone(),
@@ -423,6 +602,25 @@ impl Supervisor {
         let (stop_signal_tx, stop_signal_rx) = watch::channel(false);
         let session_id = self.next_session_id;
         self.next_session_id = self.next_session_id.wrapping_add(1);
+
+        let ptp_event_tx = self.session_event_tx.clone();
+        let ptp_join_handle = tokio::spawn(async move {
+            match ptp_join.await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    let _ = ptp_event_tx
+                        .send(SessionEvent {
+                            session_id,
+                            task: SessionTaskKind::Timing,
+                            result: Err(err),
+                        })
+                        .await;
+                }
+                Err(join_err) => {
+                    tracing::error!(error = %join_err, "PTP task panicked");
+                }
+            }
+        });
 
         let timing_event_tx = self.session_event_tx.clone();
         let timing_stop_rx = stop_signal_rx.clone();
@@ -439,9 +637,20 @@ impl Supervisor {
 
         let pipeline_event_tx = self.session_event_tx.clone();
         let pipeline_stop_rx = stop_signal_rx.clone();
-        let audio_ctx = session_keys.audio.clone();
+        let audio_key = session_keys.audio.key.clone();
+        let ptp_master_clone = Arc::clone(&ptp_master);
         let pipeline_join = tokio::spawn(async move {
-            let result = StreamPipeline::run(pcm_rx, audio_ctx, sender, pipeline_stop_rx).await;
+            let result = StreamPipeline::run(
+                pcm_rx,
+                audio_key,
+                sender,
+                initial_seq,
+                initial_rtptime,
+                sync_sender,
+                ptp_master_clone,
+                pipeline_stop_rx,
+            )
+            .await;
             let _ = pipeline_event_tx
                 .send(SessionEvent {
                     session_id,
@@ -450,6 +659,8 @@ impl Supervisor {
                 })
                 .await;
         });
+
+        let event_stop_rx = stop_signal_rx.clone();
 
         let keepalive_event_tx = self.session_event_tx.clone();
         let keepalive_rtsp = Arc::clone(&rtsp);
@@ -501,15 +712,33 @@ impl Supervisor {
             }
         });
 
+        let event_join = event_channel.map(|stream| {
+            let ev_tx = self.session_event_tx.clone();
+            let mut ev_stop = event_stop_rx;
+            tokio::spawn(async move {
+                let result = run_event_channel(stream, &mut ev_stop).await;
+                let _ = ev_tx
+                    .send(SessionEvent {
+                        session_id,
+                        task: SessionTaskKind::Event,
+                        result,
+                    })
+                    .await;
+            })
+        });
+
         Ok(ActiveSession {
             id: session_id,
             device,
             rtsp,
             stop_tx: stop_signal_tx,
             capture_stop_tx: stop_tx,
+            ptp_master: Some(Arc::clone(&ptp_master)),
+            ptp_join: Some(ptp_join_handle),
             timing_join,
             pipeline_join,
             keepalive_join,
+            event_join,
         })
     }
 
@@ -542,6 +771,13 @@ impl Supervisor {
             let _ = stop_tx.send(());
         }
 
+        if let Some(ptp) = session.ptp_master.take() {
+            ptp.stop();
+        }
+        if let Some(join) = session.ptp_join.take() {
+            let _ = join.await;
+        }
+
         let teardown_result = async {
             let mut rtsp = session.rtsp.lock().await;
             rtsp.teardown().await
@@ -555,6 +791,9 @@ impl Supervisor {
         let _ = session.timing_join.await;
         let _ = session.pipeline_join.await;
         let _ = session.keepalive_join.await;
+        if let Some(join) = session.event_join.take() {
+            let _ = join.await;
+        }
     }
 
     async fn handle_session_error(&mut self, err: Error) {
@@ -634,6 +873,7 @@ impl Supervisor {
     }
 
     fn transition_state(&mut self, state: ConnState) {
+        debug!(from = ?std::mem::discriminant(&self.model.state), to = ?std::mem::discriminant(&state), "state transition");
         self.model.state = state;
         self.publish_model();
     }
@@ -648,12 +888,80 @@ impl Supervisor {
     }
 }
 
+async fn run_event_channel(
+    mut stream: TcpStream,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<()> {
+    let mut buf = [0u8; 4096];
+    loop {
+        select! {
+            changed = stop.changed() => {
+                match changed {
+                    Ok(()) if *stop.borrow() => return Ok(()),
+                    Err(_) => return Ok(()),
+                    _ => {}
+                }
+            }
+            result = stream.read(&mut buf) => {
+                match result {
+                    Ok(0) => {
+                        debug!("event channel closed by peer");
+                        return Ok(());
+                    }
+                    Ok(n) => {
+                        debug!(bytes = n, "event channel received data");
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "event channel read error");
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn extract_peer_clock_port(setup_resp: &plist::Dictionary) -> u16 {
+    let timing_peer_info = setup_resp
+        .get("timingPeerInfo")
+        .and_then(plist::Value::as_dictionary);
+    let clock_ports = timing_peer_info
+        .and_then(|info| info.get("ClockPorts"))
+        .and_then(plist::Value::as_dictionary);
+
+    if let Some(ports) = clock_ports {
+        for (_uuid, port_val) in ports {
+            if let Some(port) = port_val.as_unsigned_integer() {
+                let port = port as u16;
+                debug!(port, "extracted peer clock port from SETUP response");
+                return port;
+            }
+            if let Some(port) = port_val.as_signed_integer() {
+                let port = port as u16;
+                debug!(port, "extracted peer clock port from SETUP response");
+                return port;
+            }
+        }
+    }
+
+    debug!("no ClockPorts in SETUP response, using standard PTP ports");
+    0
+}
+
 fn volume_to_db(volume: f32) -> f64 {
     if volume <= 0.0 {
         -144.0
     } else {
         (20.0 * volume.log10() * 1.5).clamp(-144.0, 0.0) as f64
     }
+}
+
+fn random_sender_device_id() -> String {
+    let bytes = rand::random::<[u8; 8]>();
+    format!(
+        "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]
+    )
 }
 
 fn random_session_uuid() -> String {

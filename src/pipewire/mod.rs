@@ -98,22 +98,6 @@ fn run_capture_thread(
         .connect(None)
         .map_err(|err| Error::PipeWire(format!("failed to connect core: {err}")))?;
 
-    let _virtual_sink = core
-        .create_object::<pw::node::Node>(
-            "adapter",
-            &pw::properties::properties! {
-                "factory.name" => "support.null-audio-sink",
-                "node.name" => spec.name.as_str(),
-                "node.description" => spec.description.as_str(),
-                "media.class" => "Audio/Sink",
-                "audio.rate" => "44100",
-                "audio.channels" => "2",
-                "audio.position" => "FL,FR",
-                "object.linger" => "true",
-            },
-        )
-        .map_err(|err| Error::PipeWire(format!("failed to create virtual sink: {err}")))?;
-
     let should_stop = Arc::new(AtomicBool::new(false));
     let chunk_bytes =
         (CHUNK_FRAMES as usize) * (spec.format.channels as usize) * SAMPLE_BYTES_S16LE;
@@ -128,13 +112,12 @@ fn run_capture_thread(
 
     let stream = pw::stream::StreamBox::new(
         &core,
-        "airsink-pipewire-monitor",
+        "airsink-capture",
         pw::properties::properties! {
             *pw::keys::MEDIA_TYPE => "Audio",
             *pw::keys::MEDIA_CATEGORY => "Capture",
             *pw::keys::MEDIA_ROLE => "Music",
             *pw::keys::STREAM_CAPTURE_SINK => "true",
-            "target.object" => spec.name.as_str(),
         },
     )
     .map_err(|err| Error::PipeWire(format!("failed to create stream: {err}")))?;

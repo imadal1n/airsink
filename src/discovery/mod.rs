@@ -9,6 +9,8 @@ use std::{
 use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent};
 use tokio::{select, sync::broadcast};
 
+use tracing::{debug, info};
+
 use crate::{Device, DeviceFeatures, DeviceId, Error, Result};
 
 const AIRPLAY_SERVICE_TYPE: &str = "_airplay._tcp.local.";
@@ -155,10 +157,16 @@ fn process_service_event(
 fn device_from_resolved(resolved: &ResolvedService) -> Option<Device> {
     let host = select_host(resolved)?;
 
-    let features_mask = resolved
+    let raw_features = resolved
         .get_property_val_str("features")
-        .and_then(parse_features_mask)
-        .unwrap_or(0);
+        .or_else(|| resolved.get_property_val_str("ft"));
+    debug!(raw_features = ?raw_features, "mDNS features property");
+    let features_mask = raw_features.and_then(parse_features_mask).unwrap_or(0);
+    info!(
+        features_mask = format_args!("0x{features_mask:016x}"),
+        transient = (features_mask & 0x0001_0000_0000_0000) != 0,
+        "parsed device features"
+    );
 
     let public_key = resolved
         .get_property_val_str("pk")
@@ -199,17 +207,28 @@ fn device_from_resolved(resolved: &ResolvedService) -> Option<Device> {
         features: DeviceFeatures {
             requires_pairing: (features_mask & 0x800) != 0,
             supports_airplay2: (features_mask & 0x400000) != 0,
+            supports_transient_pairing: (features_mask & 0x0001_0000_0000_0000) != 0,
             supports_alac: false,
         },
     })
 }
 
 fn parse_features_mask(value: &str) -> Option<u64> {
-    let first = value.split(',').next()?.trim();
-    let hex = first
+    let mut parts = value.split(',');
+    let first = parts.next()?.trim();
+    let lower = parse_hex_u64(first)?;
+    let upper = parts
+        .next()
+        .and_then(|s| parse_hex_u64(s.trim()))
+        .unwrap_or(0);
+    Some((upper << 32) | lower)
+}
+
+fn parse_hex_u64(s: &str) -> Option<u64> {
+    let hex = s
         .strip_prefix("0x")
-        .or_else(|| first.strip_prefix("0X"))
-        .unwrap_or(first);
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     u64::from_str_radix(hex, 16).ok()
 }
 
