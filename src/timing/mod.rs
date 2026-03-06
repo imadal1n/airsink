@@ -1,14 +1,21 @@
+pub mod ptp;
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::net::UdpSocket;
 use tokio::select;
 use tokio::sync::watch;
+use tracing::debug;
 
 use crate::error::{Error, Result};
 
-const TIMING_REQUEST_PT: u8 = 82;
-const TIMING_RESPONSE_PT: u8 = 83;
+/// AirPlay timing request payload type (without marker bit).
+const TIMING_REQUEST_PT: u8 = 0x52;
+/// AirPlay timing response payload type with RTP marker bit set.
+const TIMING_RESPONSE_PT_MARKER: u8 = 0xD3;
+/// RTP version 2 protocol byte.
+const RTP_PROTO: u8 = 0x80;
 const TIMING_PACKET_LEN: usize = 32;
 const NTP_UNIX_EPOCH_DELTA_SECS: u64 = 2_208_988_800;
 
@@ -58,21 +65,28 @@ impl TimingServer {
                         .map_err(|err| Error::Network(format!("timing recv failed: {err}")))?;
 
                     if len < TIMING_PACKET_LEN {
+                        debug!(len, %peer, "timing: short packet, ignoring");
                         continue;
                     }
 
-                    if buf[0] != TIMING_REQUEST_PT {
+                    let payload_type = buf[1] & 0x7F;
+                    if payload_type != TIMING_REQUEST_PT {
+                        debug!(byte0 = buf[0], byte1 = buf[1], %peer, "timing: not a request, ignoring");
                         continue;
                     }
 
                     let receive_ts = ntp_now();
                     let mut response = [0_u8; TIMING_PACKET_LEN];
-                    response[0] = TIMING_RESPONSE_PT;
-                    response[1..8].copy_from_slice(&buf[1..8]);
+                    response[0] = RTP_PROTO;
+                    response[1] = TIMING_RESPONSE_PT_MARKER;
+                    response[2] = 0;
+                    response[3] = 7;
                     response[8..16].copy_from_slice(&buf[24..32]);
                     response[16..24].copy_from_slice(&receive_ts.to_be_bytes());
                     let transmit_ts = ntp_now();
                     response[24..32].copy_from_slice(&transmit_ts.to_be_bytes());
+
+                    debug!(%peer, "timing: responded to request");
 
                     self.socket
                         .send_to(&response, peer)
