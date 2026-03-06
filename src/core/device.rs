@@ -36,6 +36,8 @@ pub struct DeviceFeatures {
     pub requires_pairing: bool,
     /// Whether the receiver supports AirPlay 2 semantics.
     pub supports_airplay2: bool,
+    /// Whether the device supports transient (PIN-less) pairing.
+    pub supports_transient_pairing: bool,
     /// Whether the receiver advertises ALAC decode support.
     pub supports_alac: bool,
 }

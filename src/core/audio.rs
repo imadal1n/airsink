@@ -41,4 +41,6 @@ pub struct EncodedFrame {
     pub rtp_timestamp: u32,
     /// Encoded ALAC payload bytes before transport encryption.
     pub payload: Bytes,
+    /// ALAC magic cookie (decoder config) needed for receiver initialization.
+    pub magic_cookie: Option<Bytes>,
 }
