@@ -1,5 +1,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::VecDeque;
 
 use bytes::{Bytes, BytesMut};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -73,6 +75,7 @@ pub struct SyncSender {
     socket: UdpSocket,
     target: SocketAddr,
     clock_id: u64,
+    ssrc: u32,
 }
 
 impl SyncSender {
@@ -80,11 +83,12 @@ impl SyncSender {
     ///
     /// `clock_id` is the 64-bit PTP clock identity advertised in every sync
     /// packet so the receiver can correlate timestamps with the PTP master.
-    pub fn new(socket: UdpSocket, target: SocketAddr, clock_id: u64) -> Self {
+    pub fn new(socket: UdpSocket, target: SocketAddr, clock_id: u64, ssrc: u32) -> Self {
         Self {
             socket,
             target,
             clock_id,
+            ssrc,
         }
     }
 
@@ -94,6 +98,10 @@ impl SyncSender {
         cur_pos: u32,
         ptp_time_ns: u64,
         rtptime: u32,
+        packet_count: u32,
+        octet_count: u32,
+        sender: &RtpSender,
+        sent_packets: &VecDeque<RtpPacket>,
     ) -> Result<()> {
         let packet = build_sync_packet(sync_type, cur_pos, ptp_time_ns, rtptime, self.clock_id);
         if sync_type == 0x90 {
@@ -112,6 +120,11 @@ impl SyncSender {
             .await
             .map_err(|err| Error::Network(format!("failed to send sync packet: {err}")))?;
 
+        let sr = build_rtcp_sr_packet(self.ssrc, rtptime, packet_count, octet_count);
+        if let Err(err) = self.socket.send_to(&sr, self.target).await {
+            tracing::debug!(error = %err, "failed to send RTCP sender report");
+        }
+
         let mut buf = [0u8; 512];
         match tokio::time::timeout(
             std::time::Duration::from_millis(5),
@@ -120,16 +133,47 @@ impl SyncSender {
         .await
         {
             Ok(Ok((n, from))) => {
-                tracing::warn!(
-                    n,
-                    %from,
-                    data_hex = %hex_str(&buf[..n.min(64)]),
-                    "control socket received data from HomePod"
-                );
+                self
+                    .handle_control_packet(&buf[..n], from, sender, sent_packets)
+                    .await;
             }
             _ => {}
         }
         Ok(())
+    }
+
+    async fn handle_control_packet(
+        &self,
+        packet: &[u8],
+        from: SocketAddr,
+        sender: &RtpSender,
+        sent_packets: &VecDeque<RtpPacket>,
+    ) {
+        if packet.len() < 8 {
+            return;
+        }
+        if packet[0] != 0x80 || packet[1] != 0xD5 {
+            tracing::debug!(
+                n = packet.len(),
+                %from,
+                header = %hex_str(&packet[..packet.len().min(8)]),
+                "control socket received non-retransmit packet"
+            );
+            return;
+        }
+
+        let seq_start = u16::from_be_bytes([packet[4], packet[5]]);
+        let seq_len = u16::from_be_bytes([packet[6], packet[7]]);
+        tracing::warn!(seq_start, seq_len, %from, "received retransmit request");
+
+        for i in 0..seq_len {
+            let seq = seq_start.wrapping_add(i);
+            if let Some(pkt) = sent_packets.iter().find(|pkt| pkt.seq == seq) {
+                if let Err(err) = sender.send_cached(pkt).await {
+                    tracing::debug!(seq, error = %err, "failed retransmitting packet");
+                }
+            }
+        }
     }
 }
 
@@ -152,13 +196,7 @@ impl RtpSender {
 
     /// Serializes and transmits one RTP packet to the configured target.
     pub async fn send(&self, pkt: &RtpPacket) -> Result<()> {
-        let mut header = rtp_header_bytes(pkt.seq, pkt.timestamp, pkt.ssrc);
-        if pkt.marker {
-            header[1] |= 0x80;
-        }
-        let mut wire = BytesMut::with_capacity(RTP_HEADER_LEN + pkt.payload.len());
-        wire.extend_from_slice(&header);
-        wire.extend_from_slice(&pkt.payload);
+        let wire = serialize_rtp_packet(pkt);
 
         if pkt.marker {
             tracing::warn!(
@@ -185,6 +223,10 @@ impl RtpSender {
 
         Ok(())
     }
+
+    pub async fn send_cached(&self, pkt: &RtpPacket) -> Result<()> {
+        self.send(pkt).await
+    }
 }
 
 /// End-to-end audio pipeline that encodes, seals, and sends RTP packets.
@@ -199,6 +241,7 @@ impl StreamPipeline {
         mut pcm_rx: mpsc::Receiver<PcmChunk>,
         audio_key: Zeroizing<[u8; 32]>,
         sender: RtpSender,
+        ssrc: u32,
         initial_seq: u16,
         initial_rtptime: u32,
         sync_sender: SyncSender,
@@ -206,10 +249,12 @@ impl StreamPipeline {
         mut stop: watch::Receiver<bool>,
     ) -> Result<()> {
         let mut seq = initial_seq;
-        let ssrc = rand::random::<u32>();
         let mut encoder: Option<Box<dyn codec::AlacEncoder + Send>> = None;
         let mut sync_sent = false;
         let mut last_sync_seq = initial_seq;
+        let mut packet_count: u32 = 0;
+        let mut octet_count: u32 = 0;
+        let mut sent_packets: VecDeque<RtpPacket> = VecDeque::with_capacity(1024);
 
         loop {
             if *stop.borrow() {
@@ -242,7 +287,8 @@ impl StreamPipeline {
                         .encode(&pcm)?;
 
                     let header = rtp_header_bytes(seq, encoded.rtp_timestamp, ssrc);
-                    let sealed = seal_audio_payload(&audio_key, seq, &header, &encoded.payload)?;
+                    let alac_plaintext = raop_alac_plaintext(&encoded.payload, FRAMES_PER_PACKET as u16);
+                    let sealed = seal_audio_payload(&audio_key, seq, &header, &alac_plaintext)?;
                     let sealed_len = sealed.len();
                     let encoded_len = encoded.payload.len();
 
@@ -261,10 +307,29 @@ impl StreamPipeline {
 
                     if seq % 500 == 0 {
                         let non_zero = pcm.data.iter().filter(|&&b| b != 0).count();
+                        let mut max_abs_sample: i32 = 0;
+                        let mut sum_abs_sample: u64 = 0;
+                        let mut sample_count: u64 = 0;
+                        for frame in pcm.data.chunks_exact(2) {
+                            let sample = i16::from_le_bytes([frame[0], frame[1]]) as i32;
+                            let abs = sample.abs();
+                            if abs > max_abs_sample {
+                                max_abs_sample = abs;
+                            }
+                            sum_abs_sample = sum_abs_sample.saturating_add(abs as u64);
+                            sample_count += 1;
+                        }
+                        let avg_abs_sample = if sample_count > 0 {
+                            sum_abs_sample / sample_count
+                        } else {
+                            0
+                        };
                         tracing::debug!(
                             seq,
                             pcm_bytes = pcm.data.len(),
                             non_zero_bytes = non_zero,
+                            max_abs_sample,
+                            avg_abs_sample,
                             encoded_len,
                             sealed_len,
                             "rtp pipeline status"
@@ -281,26 +346,78 @@ impl StreamPipeline {
 
                     let ptp_now = ptp_master.ptp_time_ns();
                     let cur_pos = encoded.rtp_timestamp.wrapping_sub(LATENCY_SAMPLES);
+                    packet_count = packet_count.wrapping_add(1);
+                    octet_count = octet_count.wrapping_add(sealed_len as u32);
+
+                    sender.send(&packet).await?;
+                    sent_packets.push_back(packet.clone());
+                    if sent_packets.len() > 1024 {
+                        let _ = sent_packets.pop_front();
+                    }
+
                     if !sync_sent {
                         let _ = sync_sender
-                            .send_sync(0x90, cur_pos, ptp_now, encoded.rtp_timestamp)
+                            .send_sync(
+                                0x90,
+                                cur_pos,
+                                ptp_now,
+                                encoded.rtp_timestamp,
+                                packet_count,
+                                octet_count,
+                                &sender,
+                                &sent_packets,
+                            )
                             .await;
                         sync_sent = true;
                         last_sync_seq = seq;
                     } else if seq.wrapping_sub(last_sync_seq) >= 125 {
                         let _ = sync_sender
-                            .send_sync(0x80, cur_pos, ptp_now, encoded.rtp_timestamp)
+                            .send_sync(
+                                0x80,
+                                cur_pos,
+                                ptp_now,
+                                encoded.rtp_timestamp,
+                                packet_count,
+                                octet_count,
+                                &sender,
+                                &sent_packets,
+                            )
                             .await;
                         last_sync_seq = seq;
                     }
-
-                    sender.send(&packet).await?;
 
                     seq = seq.wrapping_add(1);
                 }
             }
         }
     }
+}
+
+fn build_rtcp_sr_packet(ssrc: u32, rtp_timestamp: u32, packet_count: u32, octet_count: u32) -> [u8; 28] {
+    let mut data = [0u8; 28];
+    data[0] = 0x80;
+    data[1] = 200;
+    data[2] = 0x00;
+    data[3] = 0x06;
+    data[4..8].copy_from_slice(&ssrc.to_be_bytes());
+
+    let (ntp_secs, ntp_frac) = ntp_now();
+    data[8..12].copy_from_slice(&ntp_secs.to_be_bytes());
+    data[12..16].copy_from_slice(&ntp_frac.to_be_bytes());
+    data[16..20].copy_from_slice(&rtp_timestamp.to_be_bytes());
+    data[20..24].copy_from_slice(&packet_count.to_be_bytes());
+    data[24..28].copy_from_slice(&octet_count.to_be_bytes());
+    data
+}
+
+fn ntp_now() -> (u32, u32) {
+    const NTP_UNIX_EPOCH_DELTA: u64 = 2_208_988_800;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs().saturating_add(NTP_UNIX_EPOCH_DELTA);
+    let frac = ((now.subsec_nanos() as u64) << 32) / 1_000_000_000u64;
+    (secs as u32, frac as u32)
 }
 
 fn rtp_header_bytes(seq: u16, timestamp: u32, ssrc: u32) -> [u8; RTP_HEADER_LEN] {
@@ -311,6 +428,25 @@ fn rtp_header_bytes(seq: u16, timestamp: u32, ssrc: u32) -> [u8; RTP_HEADER_LEN]
     header[4..8].copy_from_slice(&timestamp.to_be_bytes());
     header[8..12].copy_from_slice(&ssrc.to_be_bytes());
     header
+}
+
+fn serialize_rtp_packet(pkt: &RtpPacket) -> BytesMut {
+    let mut header = rtp_header_bytes(pkt.seq, pkt.timestamp, pkt.ssrc);
+    if pkt.marker {
+        header[1] |= 0x80;
+    }
+    let mut wire = BytesMut::with_capacity(RTP_HEADER_LEN + pkt.payload.len());
+    wire.extend_from_slice(&header);
+    wire.extend_from_slice(&pkt.payload);
+    wire
+}
+
+fn raop_alac_plaintext(alac_payload: &[u8], frames_per_packet: u16) -> Bytes {
+    let mut plain = BytesMut::with_capacity(4 + alac_payload.len());
+    plain.extend_from_slice(&[0x00, 0x00]);
+    plain.extend_from_slice(&frames_per_packet.to_be_bytes());
+    plain.extend_from_slice(alac_payload);
+    plain.freeze()
 }
 
 fn seal_audio_payload(
@@ -326,7 +462,6 @@ fn seal_audio_payload(
     nonce[4] = seq_le[0];
     nonce[5] = seq_le[1];
 
-    // HomePod expects AAD to be exactly the 8 bytes of the RTP header from timestamp onwards
     let aad = &rtp_header[4..12];
 
     if seq % 500 == 0 || seq < 3 {

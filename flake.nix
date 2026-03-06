@@ -36,11 +36,15 @@
           rustToolchain
           pkg-config
           clang
+          makeWrapper
         ];
 
         buildInputs = with pkgs; [
           # pipewire (native audio capture + virtual sink)
           pipewire
+
+          # pulseaudio utils (pactl for sink routing)
+          pulseaudio
 
           # avahi / mdns (device discovery)
           avahi
@@ -53,6 +57,11 @@
         ];
 
         LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+
+        postFixup = ''
+          wrapProgram $out/bin/airsink \
+            --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.pulseaudio pkgs.pipewire ]}
+        '';
 
         meta = with pkgs.lib; {
           description = "AirPlay 2 audio streaming for Linux";
@@ -79,6 +88,9 @@
         buildInputs = with pkgs; [
           # pipewire (native audio capture + virtual sink)
           pipewire
+
+          # pulseaudio utils (pactl for sink routing)
+          pulseaudio
 
           # avahi / mdns (device discovery)
           avahi

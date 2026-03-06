@@ -141,6 +141,14 @@ impl RtspClient {
         self.read_counter = 0;
     }
 
+    pub fn stream_connection_id(&self) -> u64 {
+        self.session_url
+            .rsplit('/')
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(self.client_id)
+    }
+
     /// Requests `/info` and decodes the response body as a plist dictionary.
     pub async fn get_info(&mut self) -> Result<Dictionary> {
         let response = self
@@ -440,7 +448,12 @@ impl RtspClient {
         self.write_message(&wire).await?;
         tracing::debug!(method, cseq, "rtsp request sent, reading response");
 
-        let response = self.read_response().await?;
+        let response = self.read_response().await.map_err(|err| {
+            Error::Network(format!(
+                "rtsp {method} /{} response read failed: {err}",
+                normalized_path.trim_start_matches('/')
+            ))
+        })?;
         let resp_headers_str: Vec<String> = response
             .headers
             .iter()

@@ -19,7 +19,7 @@ use crate::crypto::SessionKeys;
 use crate::discovery::{DeviceEvent, start_discovery};
 use crate::error::{Error, Recoverability, Result};
 use crate::hap::HapClient;
-use crate::pipewire::{CaptureHandle, VirtualSinkSpec};
+use crate::pipewire::{AudioRouteSession, CaptureHandle, VirtualSinkSpec};
 use crate::rtp::{RtpSender, StreamPipeline, SyncSender};
 use crate::rtsp::{AudioStreamConfig, RtspClient};
 use crate::timing::TimingServer;
@@ -110,6 +110,7 @@ struct ActiveSession {
     rtsp: Arc<tokio::sync::Mutex<RtspClient>>,
     stop_tx: watch::Sender<bool>,
     capture_stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    audio_route: Option<AudioRouteSession>,
     ptp_master: Option<Arc<PtpMaster>>,
     ptp_join: Option<JoinHandle<()>>,
     timing_join: JoinHandle<()>,
@@ -328,15 +329,20 @@ impl Supervisor {
             return;
         }
 
-        match event.result {
-            Ok(()) => {
+        match (event.task, event.result) {
+            (SessionTaskKind::Keepalive | SessionTaskKind::Event, Ok(())) => {
+                debug!(task = ?event.task, "background task ended cleanly");
+            }
+            (_, Ok(())) => {
+                warn!(task = ?event.task, "session task exited unexpectedly; forcing reconnect");
                 self.handle_session_error(Error::Network(format!(
                     "{:?} task exited unexpectedly",
                     event.task
                 )))
                 .await;
             }
-            Err(err) => {
+            (_, Err(err)) => {
+                warn!(task = ?event.task, error = %err, "session task failed");
                 self.handle_session_error(err).await;
             }
         }
@@ -440,13 +446,6 @@ impl Supervisor {
         debug!("start_session: setting encryption on RTSP");
         rtsp.set_encryption(session_keys.clone());
 
-        debug!("start_session: sending GET /info");
-        let info = rtsp.get_info().await?;
-        debug!(
-            num_keys = info.len(),
-            "start_session: /info response received"
-        );
-
         debug!("start_session: binding PTP sockets");
         let ptp_sockets = PtpSockets::bind().await?;
         let our_ptp_port = ptp_sockets.event_port;
@@ -460,7 +459,7 @@ impl Supervisor {
             session_uuid,
             sender_device_id, "start_session: sending RTSP setup_session (PTP)"
         );
-        let (setup_resp, ptp_clock_id) = rtsp
+        let (setup_resp, ptp_clock_id) = match rtsp
             .setup_session(
                 &session_uuid,
                 timing_port,
@@ -470,7 +469,29 @@ impl Supervisor {
                 true,
                 our_ptp_port,
             )
-            .await?;
+            .await
+        {
+            Ok(value) => value,
+            Err(err) if is_early_eof(&err) => {
+                warn!(error = %err, "setup_session failed with early eof; retrying with fresh RTSP socket");
+                let mut retry_rtsp = RtspClient::connect(&device).await?;
+                retry_rtsp.set_encryption(session_keys.clone());
+                let value = retry_rtsp
+                    .setup_session(
+                        &session_uuid,
+                        timing_port,
+                        &sender_device_id,
+                        &sender_mac,
+                        &group_uuid,
+                        true,
+                        our_ptp_port,
+                    )
+                    .await?;
+                rtsp = retry_rtsp;
+                value
+            }
+            Err(err) => return Err(err),
+        };
         debug!("start_session: RTSP session created");
 
         for (key, val) in &setup_resp {
@@ -517,15 +538,7 @@ impl Supervisor {
 
         let initial_seq: u16 = rand::random();
         let initial_rtptime: u32 = rand::random();
-
-        debug!("start_session: sending RECORD");
-        rtsp.record(initial_seq, initial_rtptime).await?;
-        debug!("start_session: RECORD accepted");
-
-        debug!("start_session: sending SETPEERS");
-        let remote_ip = device.host.to_string();
-        rtsp.setpeers(&remote_ip).await?;
-        debug!("start_session: SETPEERS accepted");
+        let stream_ssrc: u32 = rand::random();
 
         let control_socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
             .await
@@ -555,19 +568,29 @@ impl Supervisor {
             control_port: local_control_port,
             latency_min: 11_025,
             latency_max: 88_200,
-            stream_connection_id: rand::random::<u64>(),
+            stream_connection_id: rtsp.stream_connection_id(),
         };
         debug!("start_session: sending RTSP setup_audio_stream");
         let stream_ports = rtsp.setup_audio_stream(&stream_config).await?;
         debug!(?stream_ports, "start_session: audio stream ports received");
 
+        debug!("start_session: sending RECORD");
+        rtsp.record(initial_seq, initial_rtptime).await?;
+        debug!("start_session: RECORD accepted");
+
+        debug!("start_session: sending SETPEERS");
+        let remote_ip = device.host.to_string();
+        rtsp.setpeers(&remote_ip).await?;
+        debug!("start_session: SETPEERS accepted");
+
         let sync_sender = SyncSender::new(
             control_socket,
             SocketAddr::new(device.host, stream_ports.control_port),
             ptp_clock_id as u64,
+            stream_ssrc,
         );
 
-        let lock_timeout = Duration::from_secs(15);
+        let lock_timeout = Duration::from_secs(1);
         let ptp_locked = ptp_master.wait_locked(lock_timeout).await;
         if ptp_locked {
             debug!("start_session: PTP clock locked");
@@ -584,10 +607,56 @@ impl Supervisor {
                 sample: SampleFormat::S16LE,
             },
         };
-        let CaptureHandle { pcm_rx, stop_tx } = crate::pipewire::start_capture(capture_spec)?;
+        let mut audio_route = match crate::pipewire::route_system_audio_to_virtual_sink(&capture_spec)
+        {
+            Ok(route) => Some(route),
+            Err(err) => {
+                warn!(error = %err, "audio routing setup failed; continuing without sink reroute");
+                self.set_last_error(format!(
+                    "streaming started without automatic sink reroute: {err}. Audio may still play locally."
+                ));
+                None
+            }
+        };
+        let CaptureHandle {
+            pcm_rx,
+            stop_tx: mut capture_stop_tx,
+        } = match crate::pipewire::start_capture(capture_spec) {
+            Ok(handle) => handle,
+            Err(err) => {
+                if let Some(route) = audio_route.take() {
+                    let _ = route.restore();
+                }
+                return Err(err);
+            }
+        };
 
-        let sender = RtpSender::new(device.host, stream_ports.data_port, self.cfg.bind_ip).await?;
-        rtsp.set_volume(volume_to_db(self.model.volume)).await?;
+        let cleanup_bootstrap = |capture_stop_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
+                                 audio_route: Option<AudioRouteSession>| {
+            if let Some(stop_tx) = capture_stop_tx.take() {
+                let _ = stop_tx.send(());
+            }
+            if let Some(route) = audio_route {
+                let _ = route.restore();
+            }
+        };
+
+        let sender = match RtpSender::new(device.host, stream_ports.data_port, self.cfg.bind_ip).await {
+            Ok(sender) => sender,
+            Err(err) => {
+                cleanup_bootstrap(&mut capture_stop_tx, audio_route.take());
+                return Err(err);
+            }
+        };
+
+        if let Err(err) = rtsp.set_volume(volume_to_db(self.model.volume)).await {
+            if is_early_eof(&err) {
+                warn!(error = %err, "initial RTSP volume update failed with early eof; continuing stream with receiver default volume");
+            } else {
+                cleanup_bootstrap(&mut capture_stop_tx, audio_route.take());
+                return Err(err);
+            }
+        }
 
         let ptp_master = Arc::new(ptp_master);
 
@@ -644,6 +713,7 @@ impl Supervisor {
                 pcm_rx,
                 audio_key,
                 sender,
+                stream_ssrc,
                 initial_seq,
                 initial_rtptime,
                 sync_sender,
@@ -663,50 +733,27 @@ impl Supervisor {
         let event_stop_rx = stop_signal_rx.clone();
 
         let keepalive_event_tx = self.session_event_tx.clone();
-        let keepalive_rtsp = Arc::clone(&rtsp);
         let mut keepalive_stop_rx = stop_signal_rx;
         let keepalive_join = tokio::spawn(async move {
-            let mut interval = time::interval(Duration::from_secs(10));
-            interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-
             loop {
-                select! {
-                    changed = keepalive_stop_rx.changed() => {
-                        match changed {
-                            Ok(()) => {
-                                if *keepalive_stop_rx.borrow() {
-                                    let _ = keepalive_event_tx.send(SessionEvent {
-                                        session_id,
-                                        task: SessionTaskKind::Keepalive,
-                                        result: Ok(()),
-                                    }).await;
-                                    return;
-                                }
-                            }
-                            Err(_) => {
-                                let _ = keepalive_event_tx.send(SessionEvent {
-                                    session_id,
-                                    task: SessionTaskKind::Keepalive,
-                                    result: Ok(()),
-                                }).await;
-                                return;
-                            }
-                        }
-                    }
-                    _ = interval.tick() => {
-                        let result = async {
-                            let mut client = keepalive_rtsp.lock().await;
-                            client.get_info().await.map(|_| ())
-                        }.await;
-
-                        if let Err(err) = result {
+                match keepalive_stop_rx.changed().await {
+                    Ok(()) => {
+                        if *keepalive_stop_rx.borrow() {
                             let _ = keepalive_event_tx.send(SessionEvent {
                                 session_id,
                                 task: SessionTaskKind::Keepalive,
-                                result: Err(err),
+                                result: Ok(()),
                             }).await;
                             return;
                         }
+                    }
+                    Err(_) => {
+                        let _ = keepalive_event_tx.send(SessionEvent {
+                            session_id,
+                            task: SessionTaskKind::Keepalive,
+                            result: Ok(()),
+                        }).await;
+                        return;
                     }
                 }
             }
@@ -732,7 +779,8 @@ impl Supervisor {
             device,
             rtsp,
             stop_tx: stop_signal_tx,
-            capture_stop_tx: stop_tx,
+            capture_stop_tx,
+            audio_route,
             ptp_master: Some(Arc::clone(&ptp_master)),
             ptp_join: Some(ptp_join_handle),
             timing_join,
@@ -769,6 +817,11 @@ impl Supervisor {
         let _ = session.stop_tx.send(true);
         if let Some(stop_tx) = session.capture_stop_tx.take() {
             let _ = stop_tx.send(());
+        }
+        if let Some(route) = session.audio_route.take()
+            && let Err(err) = route.restore()
+        {
+            self.set_last_error(format!("failed to restore sink routing: {err}"));
         }
 
         if let Some(ptp) = session.ptp_master.take() {
@@ -954,6 +1007,10 @@ fn volume_to_db(volume: f32) -> f64 {
     } else {
         (20.0 * volume.log10() * 1.5).clamp(-144.0, 0.0) as f64
     }
+}
+
+fn is_early_eof(err: &Error) -> bool {
+    err.to_string().contains("early eof")
 }
 
 fn random_sender_device_id() -> String {
