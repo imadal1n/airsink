@@ -177,12 +177,17 @@ fn device_from_resolved(resolved: &ResolvedService) -> Option<Device> {
         device_id_from_fullname(resolved.get_fullname())
     };
 
-    let name = resolved
-        .get_property_val_str("model")
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| display_name_from_fullname(resolved.get_fullname()));
+    let instance_name = display_name_from_fullname(resolved.get_fullname());
+    let name = if instance_name.is_empty() {
+        resolved
+            .get_property_val_str("model")
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| resolved.get_fullname().to_string())
+    } else {
+        instance_name
+    };
 
     Some(Device {
         id: device_id,
