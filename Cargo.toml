@@ -1,0 +1,82 @@
+[package]
+name = "airsink"
+version = "0.1.0"
+edition = "2024"
+description = "AirPlay 2 audio streaming from Linux to Apple devices"
+license = "MIT"
+
+[lib]
+name = "airsink"
+path = "src/lib.rs"
+
+[[bin]]
+name = "airsink"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# mDNS / DNS-SD discovery (pure Rust)
+mdns-sd = "0.18"
+
+# Crypto: Ed25519 signing (HAP pairing identity)
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+
+# Crypto: X25519 ECDH (pair-verify key exchange)
+x25519-dalek = "2"
+
+# Crypto: AEAD encryption (RTSP channel + RTP payloads)
+chacha20poly1305 = "0.10"
+
+# Crypto: key derivation (HKDF-SHA512 for session keys)
+hkdf = "0.12"
+sha2 = "0.10"
+
+# Crypto: SRP-6a (HAP pair-setup authentication)
+srp = "0.6"
+num-bigint = { version = "0.4", features = ["rand"] }
+num-traits = "0.2"
+
+# Crypto: RNG
+rand = "0.8"
+
+# Crypto: zeroing sensitive memory
+zeroize = { version = "1", features = ["derive"] }
+
+# Apple binary plist (RTSP message bodies)
+plist = "1"
+
+# Native PipeWire audio capture
+pipewire = "0.9"
+
+# ALAC encoding (pure Rust)
+alac-encoder = "0.3"
+
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Serialization (config, credential persistence)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Byte buffers
+bytes = "1"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# XDG config directories
+dirs = "6"
+
+# Base64 (protocol encoding)
+base64 = "0.22"
