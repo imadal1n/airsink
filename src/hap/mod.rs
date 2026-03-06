@@ -159,6 +159,19 @@ impl HapClient {
         })
     }
 
+    /// Executes a transient HAP Pair-Setup exchange without persisting credentials.
+    ///
+    /// Used when no stored pairing exists. Performs a two-round SRP-6a exchange
+    /// using the fixed PIN `3939` and `Flags=0x10` with `X-Apple-HKP: 4` to
+    /// signal a transient session to the receiver.
+    ///
+    /// Key derivation differs from full pair-setup:
+    /// - RTSP control keys: HKDF-SHA512 over the SRP session key with
+    ///   salt `"Control-Salt"` and info `"Control-{Write,Read}-Encryption-Key"`
+    /// - Audio key: first 32 bytes of the raw SRP session key (no HKDF)
+    ///
+    /// The returned [`SessionKeys`] are used immediately for the RTSP session
+    /// and are not stored to disk; the next connection will repeat this flow.
     pub async fn pair_setup_transient(&mut self) -> Result<SessionKeys> {
         let method = [0_u8];
         let state_1 = [1_u8];

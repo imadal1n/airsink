@@ -62,6 +62,13 @@ fn build_sync_packet(
     data
 }
 
+/// Sends AirPlay RTP sync packets (payload type `0xD7`) on the control socket.
+///
+/// Sync packets carry the PTP master clock timestamp alongside the current RTP
+/// position so the receiver can maintain playout synchronisation. The first
+/// packet uses sync type `0x90` (first-packet flag); subsequent packets use
+/// `0x80`. Packets are sent once at stream start and every 125 RTP packets
+/// thereafter (~1 second at 125 pkt/sec).
 pub struct SyncSender {
     socket: UdpSocket,
     target: SocketAddr,
@@ -69,6 +76,10 @@ pub struct SyncSender {
 }
 
 impl SyncSender {
+    /// Constructs a sync sender that transmits on `socket` to `target`.
+    ///
+    /// `clock_id` is the 64-bit PTP clock identity advertised in every sync
+    /// packet so the receiver can correlate timestamps with the PTP master.
     pub fn new(socket: UdpSocket, target: SocketAddr, clock_id: u64) -> Self {
         Self {
             socket,

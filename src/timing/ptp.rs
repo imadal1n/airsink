@@ -59,10 +59,14 @@ struct HeaderFields {
     log_message_interval: i8,
 }
 
+/// Configuration for a PTP follower session targeting one HomePod clock master.
 #[derive(Debug, Clone, Copy)]
 pub struct PtpConfig {
+    /// 64-bit PTP clock identity for this sender, advertised in every PTP message.
     pub clock_id: i64,
+    /// IP address of the HomePod acting as PTP grandmaster.
     pub peer_addr: IpAddr,
+    /// HomePod PTP event port. Pass `0` to use the standard port 319.
     pub peer_clock_port: u16,
 }
 
@@ -97,6 +101,15 @@ impl PtpSockets {
     }
 }
 
+/// Handle to a running PTP follower task.
+///
+/// The follower tracks the HomePod's IEEE 1588v2 grandmaster clock by
+/// collecting `Follow_Up` messages and maintaining a sliding window of eight
+/// one-way offset samples. It is considered locked once all eight samples have
+/// been collected and their jitter falls below 50 ms.
+///
+/// Clock time is exposed via [`PtpMaster::ptp_time_ns`] and used by
+/// [`crate::rtp::SyncSender`] to timestamp sync packets.
 #[derive(Debug)]
 pub struct PtpMaster {
     stop_tx: watch::Sender<bool>,
@@ -106,6 +119,11 @@ pub struct PtpMaster {
 }
 
 impl PtpMaster {
+    /// Starts the PTP follower task and returns a handle plus its join handle.
+    ///
+    /// Sends an IEEE 1588v2 awakening sequence (Signaling + two Announce
+    /// messages) to encourage the HomePod to begin sending `Follow_Up` frames,
+    /// then enters the receive loop on `sockets`.
     pub async fn start(
         config: PtpConfig,
         sockets: PtpSockets,
@@ -168,10 +186,16 @@ impl PtpMaster {
         ))
     }
 
+    /// Signals the PTP follower task to exit its receive loop.
     pub fn stop(&self) {
         let _ = self.stop_tx.send(true);
     }
 
+    /// Waits until the follower acquires clock lock or `timeout` elapses.
+    ///
+    /// Lock is acquired when eight consecutive `Follow_Up` offset samples have
+    /// been collected and their peak-to-peak jitter is below 50 ms. Returns
+    /// `true` if locked, `false` if the timeout elapsed before lock.
     pub async fn wait_locked(&self, timeout: Duration) -> bool {
         let mut rx = self.locked_rx.clone();
         if *rx.borrow() {
