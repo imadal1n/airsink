@@ -76,7 +76,7 @@ impl SrpClient {
             }
         };
 
-        let public_a_bytes = self.pad_to_n(&public_a);
+        let public_a_bytes = public_a.to_bytes_be();
         self.public_a = Some(public_a);
         self.private_a = Some(private_a.clone());
         self.session_key = None;
@@ -105,6 +105,7 @@ impl SrpClient {
             return Err(Error::Hap("srp server public key is invalid".to_owned()));
         }
 
+        // k and u use PAD(x) per RFC 5054 / Apple SRP variant
         let k = self.compute_multiplier_k();
         let public_a_padded = self.pad_to_n(public_a);
         let public_b_padded = self.pad_to_n(&public_b);
@@ -123,11 +124,16 @@ impl SrpClient {
         };
         let exponent = private_a + (&u * &x);
         let shared_secret = base.modpow(&exponent, &self.n);
-        let shared_secret_padded = self.pad_to_n(&shared_secret);
-        let session_key = hash_bytes(&[&shared_secret_padded]);
+
+        // K, M1, M2 use raw (unpadded) byte representations per csrp/owntone
+        let public_a_raw = public_a.to_bytes_be();
+        let public_b_raw = public_b.to_bytes_be();
+        let shared_secret_raw = shared_secret.to_bytes_be();
+        let session_key = hash_bytes(&[&shared_secret_raw]);
 
         let hash_n = hash_bytes(&[&self.n_bytes]);
-        let hash_g = hash_bytes(&[&self.pad_to_n(&self.g)]);
+        let g_raw = self.g.to_bytes_be();
+        let hash_g = hash_bytes(&[&g_raw]);
         let hash_i = hash_bytes(&[&self.username]);
 
         let hash_ng_xor: Vec<u8> = hash_n
@@ -140,11 +146,11 @@ impl SrpClient {
             &hash_ng_xor,
             &hash_i,
             salt,
-            &public_a_padded,
-            &public_b_padded,
+            &public_a_raw,
+            &public_b_raw,
             &session_key,
         ]);
-        let expected_server_proof = hash_bytes(&[&public_a_padded, &client_proof, &session_key]);
+        let expected_server_proof = hash_bytes(&[&public_a_raw, &client_proof, &session_key]);
 
         self.session_key = Some(session_key.clone());
         self.expected_server_proof = Some(expected_server_proof);

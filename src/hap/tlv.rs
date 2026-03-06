@@ -22,6 +22,8 @@ pub enum TlvTag {
     Error = 0x07,
     /// Ed25519 signature bytes.
     Signature = 0x0A,
+    /// Pairing flags (e.g. transient mode).
+    Flags = 0x13,
 }
 
 impl TryFrom<u8> for TlvTag {
@@ -38,6 +40,7 @@ impl TryFrom<u8> for TlvTag {
             0x06 => Ok(Self::State),
             0x07 => Ok(Self::Error),
             0x0A => Ok(Self::Signature),
+            0x13 => Ok(Self::Flags),
             tag => Err(Error::Hap(format!("unknown tlv tag: 0x{tag:02x}"))),
         }
     }
@@ -80,7 +83,7 @@ pub fn decode(data: &[u8]) -> Result<Vec<(TlvTag, Vec<u8>)>> {
             return Err(Error::Hap("truncated tlv header".to_owned()));
         }
 
-        let tag = TlvTag::try_from(data[idx])?;
+        let raw_tag = data[idx];
         let len = data[idx + 1] as usize;
         idx += 2;
 
@@ -90,6 +93,11 @@ pub fn decode(data: &[u8]) -> Result<Vec<(TlvTag, Vec<u8>)>> {
 
         let value = &data[idx..idx + len];
         idx += len;
+
+        let tag = match TlvTag::try_from(raw_tag) {
+            Ok(tag) => tag,
+            Err(_) => continue,
+        };
 
         if let Some((last_tag, last_value)) = out.last_mut()
             && *last_tag == tag

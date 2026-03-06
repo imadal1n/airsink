@@ -31,6 +31,15 @@ pub struct HapClient {
 }
 
 impl HapClient {
+    /// Consumes this client and returns the underlying TCP stream and buffered data.
+    ///
+    /// After pairing completes, the same TCP connection must be reused for
+    /// encrypted RTSP communication. Call this to hand the stream off to
+    /// [`RtspClient::from_parts`].
+    pub fn into_parts(self) -> (TcpStream, Vec<u8>) {
+        (self.stream, self.read_buffer)
+    }
+
     /// Opens a TCP connection to the receiver's RTSP/HAP endpoint.
     ///
     /// A single connection is reused across handshake requests to match the
@@ -150,6 +159,83 @@ impl HapClient {
         })
     }
 
+    pub async fn pair_setup_transient(&mut self) -> Result<SessionKeys> {
+        let method = [0_u8];
+        let state_1 = [1_u8];
+        let flags: [u8; 1] = [0x10];
+        let hkp_header = Some(("X-Apple-HKP", "4"));
+        let m1_body = tlv::encode(&[
+            (TlvTag::Method, &method),
+            (TlvTag::State, &state_1),
+            (TlvTag::Flags, &flags),
+        ]);
+        tracing::debug!("transient pair-setup M1: sending with Flags=0x10 (1 byte)");
+        let m2 = self
+            .post_tlv_with_header("/pair-setup", &m1_body, Some(2), hkp_header)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "transient M1→M2 failed");
+                e
+            })?;
+        tracing::debug!("transient pair-setup M2: received salt and server public key");
+
+        let salt = required_tlv(&m2, TlvTag::Salt)?;
+        let server_pubkey_b = required_tlv(&m2, TlvTag::PublicKey)?;
+
+        let mut srp = SrpClient::new(b"Pair-Setup", b"3939");
+        let (public_a, _) = srp.start_auth();
+        let (proof_m1, session_key) = srp.process_challenge(salt, server_pubkey_b)?;
+
+        let state_3 = [3_u8];
+        let m3_body = tlv::encode(&[
+            (TlvTag::State, &state_3),
+            (TlvTag::PublicKey, &public_a),
+            (TlvTag::Proof, &proof_m1),
+        ]);
+        tracing::debug!("transient pair-setup M3: sending SRP proof");
+        let m4 = self
+            .post_tlv_with_header("/pair-setup", &m3_body, Some(4), hkp_header)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "transient M3→M4 failed (SRP proof rejected)");
+                e
+            })?;
+        tracing::debug!("transient pair-setup M4: verifying server proof");
+        let server_proof = required_tlv(&m4, TlvTag::Proof)?;
+        srp.verify_server(server_proof)?;
+
+        let control_write_key = hkdf_expand_32(
+            b"Control-Salt",
+            &session_key,
+            b"Control-Write-Encryption-Key",
+        )?;
+        let control_read_key = hkdf_expand_32(
+            b"Control-Salt",
+            &session_key,
+            b"Control-Read-Encryption-Key",
+        )?;
+
+        let mut audio_shared_key = [0u8; 32];
+        audio_shared_key.copy_from_slice(&session_key[..32]);
+
+        let base_rtp_timestamp = rand::random::<u32>();
+        Ok(SessionKeys {
+            rtsp: AeadContext::new(
+                control_write_key,
+                NonceStrategy::Counter32 { fixed: [0_u8; 8] },
+            ),
+            rtsp_read: AeadContext::new(
+                control_read_key,
+                NonceStrategy::Counter32 { fixed: [0_u8; 8] },
+            ),
+            audio: AeadContext::new(
+                audio_shared_key,
+                NonceStrategy::Counter32 { fixed: [0_u8; 8] },
+            ),
+            base_rtp_timestamp,
+        })
+    }
+
     /// Executes the HAP Pair-Verify flow and derives transport session keys.
     ///
     /// This authenticates both peers using Curve25519 ephemeral keys plus
@@ -233,8 +319,12 @@ impl HapClient {
                 control_write_key,
                 NonceStrategy::Counter32 { fixed: [0_u8; 8] },
             ),
-            audio: AeadContext::new(
+            rtsp_read: AeadContext::new(
                 control_read_key,
+                NonceStrategy::Counter32 { fixed: [0_u8; 8] },
+            ),
+            audio: AeadContext::new(
+                shared_secret,
                 NonceStrategy::Counter32 { fixed: [0_u8; 8] },
             ),
             base_rtp_timestamp,
@@ -247,7 +337,18 @@ impl HapClient {
         payload: &[u8],
         expected_state: Option<u8>,
     ) -> Result<Vec<(TlvTag, Vec<u8>)>> {
-        let body = self.post_bytes(path, payload).await?;
+        self.post_tlv_with_header(path, payload, expected_state, None)
+            .await
+    }
+
+    async fn post_tlv_with_header(
+        &mut self,
+        path: &str,
+        payload: &[u8],
+        expected_state: Option<u8>,
+        extra_header: Option<(&str, &str)>,
+    ) -> Result<Vec<(TlvTag, Vec<u8>)>> {
+        let body = self.post_bytes(path, payload, extra_header).await?;
         let decoded = tlv::decode(&body)?;
         check_tlv_error(&decoded)?;
         if let Some(expected_state) = expected_state {
@@ -256,11 +357,20 @@ impl HapClient {
         Ok(decoded)
     }
 
-    async fn post_bytes(&mut self, path: &str, payload: &[u8]) -> Result<Vec<u8>> {
+    async fn post_bytes(
+        &mut self,
+        path: &str,
+        payload: &[u8],
+        extra_header: Option<(&str, &str)>,
+    ) -> Result<Vec<u8>> {
+        let extra_header = extra_header
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .unwrap_or_default();
         let request = format!(
-            "POST {path} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+            "POST {path} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n{}\r\n",
             self.host_header,
             payload.len(),
+            extra_header,
         );
 
         self.stream
