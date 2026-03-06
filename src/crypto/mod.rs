@@ -10,9 +10,12 @@ use crate::error::{Error, Result};
 /// Session-scoped symmetric keys used by control and media paths.
 #[derive(Debug, Clone)]
 pub struct SessionKeys {
-    /// AEAD context for encrypted RTSP/control channel payloads.
+    /// AEAD context for encrypting outgoing RTSP control messages.
     pub rtsp: AeadContext,
-    /// AEAD context for encrypted RTP audio payloads.
+    /// AEAD context for decrypting incoming RTSP control responses.
+    pub rtsp_read: AeadContext,
+    /// AEAD context for encrypting RTP audio payloads.
+    /// Key matches the raw shared secret sent as `shk` in audio SETUP.
     pub audio: AeadContext,
     /// Initial RTP timestamp chosen for this stream session.
     pub base_rtp_timestamp: u32,

@@ -11,6 +11,9 @@ const STREAM_FRAMES_PER_PACKET: u32 = 352;
 pub trait AlacEncoder {
     /// Encodes one PCM chunk and returns the payload plus RTP timestamp.
     fn encode(&mut self, pcm: &PcmChunk) -> Result<EncodedFrame>;
+
+    /// Returns the ALAC magic cookie (decoder config) if available.
+    fn magic_cookie(&self) -> Option<Bytes>;
 }
 
 /// `alac-encoder` crate-backed ALAC encoder implementation.
@@ -59,7 +62,12 @@ impl AlacEncoder for CrateAlacEncoder {
         Ok(EncodedFrame {
             rtp_timestamp,
             payload,
+            magic_cookie: self.magic_cookie(),
         })
+    }
+
+    fn magic_cookie(&self) -> Option<Bytes> {
+        Some(Bytes::from(self.inner.magic_cookie()))
     }
 }
 
@@ -70,6 +78,7 @@ impl AlacEncoder for CrateAlacEncoder {
 pub fn new_encoder(
     format: PcmFormat,
     frames_per_packet: u32,
+    initial_timestamp: u32,
 ) -> Result<Box<dyn AlacEncoder + Send>> {
     validate_stream_format(format)?;
 
@@ -92,7 +101,7 @@ pub fn new_encoder(
         inner: alac_encoder::AlacEncoder::new(&output_format),
         input_format,
         scratch,
-        next_rtp_timestamp: 0,
+        next_rtp_timestamp: initial_timestamp,
         frames_per_packet: STREAM_FRAMES_PER_PACKET,
     }))
 }

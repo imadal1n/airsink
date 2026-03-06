@@ -27,13 +27,15 @@ pub struct AudioStreamConfig {
     pub spf: u32,
     /// Audio sample rate in Hertz.
     pub sr: u32,
+    /// ALAC magic cookie (decoder config) sent as `asc` in audio SETUP.
+    pub asc: Option<Vec<u8>>,
     /// Session key bytes used by the receiver for payload decryption.
     pub shk: Vec<u8>,
     /// Local UDP control port advertised to the receiver.
     pub control_port: u16,
-    /// Minimum target stream latency in milliseconds.
+    /// Minimum target stream latency in 44.1 kHz sample counts.
     pub latency_min: u32,
-    /// Maximum target stream latency in milliseconds.
+    /// Maximum target stream latency in 44.1 kHz sample counts.
     pub latency_max: u32,
     /// Unique identifier used to bind stream-related RTSP messages.
     pub stream_connection_id: u64,
@@ -69,14 +71,53 @@ pub struct RtspClient {
     read_counter: u64,
     read_buffer: BytesMut,
     session_header: Option<String>,
+    /// Persistent 64-bit identifier for `Client-Instance` and `DACP-ID` headers.
+    client_id: u64,
+    /// RTSP session base URL in the form `rtsp://<local_ip>/<session_id>`.
+    session_url: String,
+    /// Local IP address of this sender, used in PTP peer info.
+    local_ip: String,
 }
 
 impl RtspClient {
+    /// Wraps an existing TCP stream as an RTSP client, carrying over buffered data.
+    pub fn from_parts(stream: TcpStream, leftover: &[u8], device: &Device) -> Self {
+        let local_ip = stream
+            .local_addr()
+            .map(|a| a.ip().to_string())
+            .unwrap_or_else(|_| "0.0.0.0".to_owned());
+        let rtsp_session_id: u32 = rand::random();
+        let session_url = format!("rtsp://{local_ip}/{rtsp_session_id}");
+
+        let mut read_buffer = BytesMut::new();
+        read_buffer.extend_from_slice(leftover);
+        Self {
+            stream,
+            device: device.clone(),
+            cseq: 0,
+            session_keys: None,
+            write_counter: 0,
+            read_counter: 0,
+            read_buffer,
+            session_header: None,
+            client_id: rand::random(),
+            session_url,
+            local_ip,
+        }
+    }
+
     /// Connects to a receiver RTSP endpoint and initializes client state.
     pub async fn connect(device: &Device) -> Result<Self> {
         let stream = TcpStream::connect((device.host, device.port_rtsp))
             .await
             .map_err(|err| Error::Network(format!("rtsp connect failed: {err}")))?;
+
+        let local_ip = stream
+            .local_addr()
+            .map(|a| a.ip().to_string())
+            .unwrap_or_else(|_| "0.0.0.0".to_owned());
+        let rtsp_session_id: u32 = rand::random();
+        let session_url = format!("rtsp://{local_ip}/{rtsp_session_id}");
 
         Ok(Self {
             stream,
@@ -87,6 +128,9 @@ impl RtspClient {
             read_counter: 0,
             read_buffer: BytesMut::new(),
             session_header: None,
+            client_id: rand::random(),
+            session_url,
+            local_ip,
         })
     }
 
@@ -105,47 +149,76 @@ impl RtspClient {
         parse_plist_dictionary(&response.body)
     }
 
-    /// Creates an RTSP session and announces timing metadata to the receiver.
+    /// Creates an RTSP session with the receiver, negotiating timing protocol.
+    #[allow(clippy::too_many_arguments)]
     pub async fn setup_session(
         &mut self,
         session_uuid: &str,
         timing_port: u16,
-    ) -> Result<Dictionary> {
+        sender_device_id: &str,
+        sender_mac: &str,
+        group_uuid: &str,
+        use_ptp: bool,
+        _ptp_clock_port: u16,
+    ) -> Result<(Dictionary, i64)> {
         let mut body = Dictionary::new();
+        body.insert("name".to_owned(), Value::String("airsink".to_owned()));
         body.insert(
             "deviceID".to_owned(),
-            Value::String(self.device.id.0.clone()),
+            Value::String(sender_device_id.to_owned()),
         );
         body.insert(
             "sessionUUID".to_owned(),
             Value::String(session_uuid.to_owned()),
         );
-        body.insert("timingPort".to_owned(), Value::from(timing_port as u64));
-        body.insert("timingProtocol".to_owned(), Value::String("NTP".to_owned()));
         body.insert(
             "macAddress".to_owned(),
-            Value::String("00:00:00:00:00:00".to_owned()),
+            Value::String(sender_mac.to_owned()),
         );
-        body.insert("model".to_owned(), Value::String("AirSink1,1".to_owned()));
-        body.insert("name".to_owned(), Value::String("airsink".to_owned()));
-        body.insert("osName".to_owned(), Value::String("Linux".to_owned()));
-        body.insert("osVersion".to_owned(), Value::String("1.0".to_owned()));
-        body.insert(
-            "sourceVersion".to_owned(),
-            Value::String("366.0".to_owned()),
-        );
+        body.insert("groupUUID".to_owned(), Value::String(group_uuid.to_owned()));
+        body.insert("groupContainsGroupLeader".to_owned(), Value::Boolean(false));
+
+        let clock_id = if use_ptp {
+            body.insert("timingProtocol".to_owned(), Value::String("PTP".to_owned()));
+            let clock_id = rand::random::<i64>();
+            let ptp_id = random_uuid_string();
+            let addresses = vec![Value::String(self.local_ip.clone())];
+
+            let mut timing_peer_info = Dictionary::new();
+            timing_peer_info.insert("ID".to_owned(), Value::String(ptp_id.clone()));
+            timing_peer_info.insert("DeviceType".to_owned(), Value::from(0_u64));
+            timing_peer_info.insert("ClockID".to_owned(), Value::Integer(clock_id.into()));
+            timing_peer_info.insert(
+                "SupportsClockPortMatchingOverride".to_owned(),
+                Value::Boolean(false),
+            );
+            timing_peer_info.insert("Addresses".to_owned(), Value::Array(addresses));
+
+            let timing_peer_list = Value::Array(vec![Value::Dictionary(timing_peer_info.clone())]);
+
+            body.insert(
+                "timingPeerInfo".to_owned(),
+                Value::Dictionary(timing_peer_info),
+            );
+            body.insert("timingPeerList".to_owned(), timing_peer_list);
+            clock_id
+        } else {
+            body.insert("timingProtocol".to_owned(), Value::String("NTP".to_owned()));
+            body.insert("timingPort".to_owned(), Value::from(timing_port as u64));
+            0
+        };
 
         let response = self
             .request(
-                "POST",
-                "setup",
+                "SETUP",
+                "",
                 Vec::new(),
                 Some("application/x-apple-binary-plist"),
                 plist_to_binary(&body)?,
             )
             .await?;
 
-        parse_plist_dictionary(&response.body)
+        Ok((parse_plist_dictionary(&response.body)?, clock_id))
     }
 
     /// Negotiates one audio stream and returns receiver-assigned transport ports.
@@ -165,6 +238,9 @@ impl RtspClient {
         stream_dict.insert("ct".to_owned(), Value::from(stream_config.ct as u64));
         stream_dict.insert("spf".to_owned(), Value::from(stream_config.spf as u64));
         stream_dict.insert("sr".to_owned(), Value::from(stream_config.sr as u64));
+        if let Some(asc) = &stream_config.asc {
+            stream_dict.insert("asc".to_owned(), Value::Data(asc.clone()));
+        }
         stream_dict.insert("shk".to_owned(), Value::Data(stream_config.shk.clone()));
         stream_dict.insert(
             "controlPort".to_owned(),
@@ -182,6 +258,12 @@ impl RtspClient {
             "streamConnectionID".to_owned(),
             Value::from(stream_config.stream_connection_id),
         );
+        stream_dict.insert("audioMode".to_owned(), Value::String("default".to_owned()));
+        stream_dict.insert("isMedia".to_owned(), Value::Boolean(true));
+        stream_dict.insert(
+            "supportsDynamicStreamID".to_owned(),
+            Value::Boolean(false),
+        );
 
         let mut body = Dictionary::new();
         body.insert(
@@ -191,8 +273,8 @@ impl RtspClient {
 
         let response = self
             .request(
-                "POST",
-                "setup",
+                "SETUP",
+                "",
                 Vec::new(),
                 Some("application/x-apple-binary-plist"),
                 plist_to_binary(&body)?,
@@ -203,17 +285,41 @@ impl RtspClient {
         extract_stream_ports(&response_dict)
     }
 
-    /// Sends `RECORD` to start RTP playout from the provided sequence and time.
-    pub async fn record(&mut self, seq: u16, rtptime: u32) -> Result<()> {
+    /// Sends `RECORD` to start the session playout with owntone-compatible headers.
+    pub async fn record(&mut self, initial_seq: u16, initial_rtptime: u32) -> Result<()> {
         self.request(
             "RECORD",
             "",
-            vec![(
-                "RTP-Info".to_owned(),
-                format!("seq={seq};rtptime={rtptime}"),
-            )],
+            vec![
+                ("Range".to_owned(), "npt=0-".to_owned()),
+                (
+                    "RTP-Info".to_owned(),
+                    format!("seq={initial_seq};rtptime={initial_rtptime}"),
+                ),
+            ],
             None,
             Bytes::new(),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Sends `SETPEERS` with the PTP peer address list.
+    pub async fn setpeers(&mut self, remote_ip: &str) -> Result<()> {
+        let peers = Value::Array(vec![
+            Value::String(remote_ip.to_owned()),
+            Value::String(self.local_ip.clone()),
+        ]);
+        let mut body_buf = Vec::new();
+        plist::to_writer_binary(&mut body_buf, &peers)
+            .map_err(|err| Error::Rtsp(format!("setpeers plist encode failed: {err}")))?;
+
+        self.request(
+            "SETPEERS",
+            "peer-list-changed",
+            Vec::new(),
+            Some("application/x-apple-binary-plist"),
+            Bytes::from(body_buf),
         )
         .await?;
         Ok(())
@@ -266,18 +372,43 @@ impl RtspClient {
     ) -> Result<RtspResponse> {
         let cseq = self.next_cseq();
         let normalized_path = if path.is_empty() { "/" } else { path };
+        tracing::debug!(
+            method,
+            path = normalized_path,
+            cseq,
+            encrypted = self.session_keys.is_some(),
+            body_len = body.len(),
+            "rtsp request sending"
+        );
+
+        // For requests with a specific path (e.g. GET /info), use remote host URL.
+        // For requests with empty path (e.g. SETUP session), use session_url
+        // which is rtsp://<local_ip>/<session_id> per owntone convention.
+        let uri = if path.is_empty() {
+            self.session_url.clone()
+        } else {
+            let host_part = if self.device.host.is_ipv6() {
+                format!("[{}]:{}", self.device.host, self.device.port_rtsp)
+            } else {
+                format!("{}:{}", self.device.host, self.device.port_rtsp)
+            };
+            format!("rtsp://{}/{}", host_part, path.trim_start_matches('/'))
+        };
 
         let mut request = String::new();
         request.push_str(method);
         request.push(' ');
-        request.push('/');
-        request.push_str(normalized_path.trim_start_matches('/'));
+        request.push_str(&uri);
         request.push_str(" RTSP/1.0\r\n");
         request.push_str(&format!("CSeq: {cseq}\r\n"));
         request.push_str(&format!("User-Agent: {USER_AGENT}\r\n"));
+        request.push_str("X-Apple-Client-Name: airsink\r\n");
         request.push_str(&format!(
             "X-Apple-ProtocolVersion: {APPLE_PROTOCOL_VERSION}\r\n"
         ));
+        request.push_str(&format!("Client-Instance: {:016X}\r\n", self.client_id));
+        request.push_str(&format!("DACP-ID: {:016X}\r\n", self.client_id));
+        request.push_str(&format!("Active-Remote: {}\r\n", self.client_id as u32));
 
         if let Some(session_header) = &self.session_header {
             request.push_str(&format!("Session: {session_header}\r\n"));
@@ -302,13 +433,22 @@ impl RtspClient {
         request.push_str(&format!("Content-Length: {}\r\n", body.len()));
         request.push_str("\r\n");
 
+        tracing::debug!(method, cseq, "rtsp headers:\n{}", request);
         let mut wire = request.into_bytes();
         wire.extend_from_slice(&body);
 
         self.write_message(&wire).await?;
+        tracing::debug!(method, cseq, "rtsp request sent, reading response");
 
         let response = self.read_response().await?;
+        let resp_headers_str: Vec<String> = response
+            .headers
+            .iter()
+            .map(|(k, v)| format!("{k}: {v}"))
+            .collect();
+        tracing::debug!(method, cseq, code = response.code, reason = %response.reason, body_len = response.body.len(), headers = %resp_headers_str.join(", "), "rtsp response received");
         if let Some(session_header) = find_header_value(&response.headers, "Session") {
+            tracing::debug!(session_header, "captured Session header from response");
             self.session_header = Some(session_header.to_owned());
         }
 
@@ -352,7 +492,7 @@ impl RtspClient {
         for chunk in message.chunks(ENCRYPTED_BLOCK_MAX_LEN) {
             let len_u16 = u16::try_from(chunk.len())
                 .map_err(|_| Error::Rtsp("encrypted RTSP block exceeds u16 length".to_owned()))?;
-            let aad = len_u16.to_be_bytes();
+            let aad = len_u16.to_le_bytes();
 
             let sealed = seal_rtsp_block(&keys.rtsp, self.write_counter, &aad, chunk)?;
             if sealed.len() < POLY1305_TAG_LEN {
@@ -395,7 +535,7 @@ impl RtspClient {
                     .read_exact(&mut len_buf)
                     .await
                     .map_err(|err| Error::Network(format!("rtsp encrypted read failed: {err}")))?;
-                let block_len = u16::from_be_bytes(len_buf) as usize;
+                let block_len = u16::from_le_bytes(len_buf) as usize;
 
                 let mut block_buf = vec![0_u8; block_len + POLY1305_TAG_LEN];
                 self.stream
@@ -408,7 +548,7 @@ impl RtspClient {
                     .as_ref()
                     .ok_or_else(|| Error::Rtsp("missing RTSP encryption keys".to_owned()))?;
                 let decrypted =
-                    open_rtsp_block(&keys.rtsp, self.read_counter, &len_buf, &block_buf)?;
+                    open_rtsp_block(&keys.rtsp_read, self.read_counter, &len_buf, &block_buf)?;
                 self.read_counter = self.read_counter.wrapping_add(1);
                 self.read_buffer.extend_from_slice(&decrypted);
             } else {
@@ -582,6 +722,29 @@ fn try_parse_response(buffer: &mut BytesMut) -> Result<Option<RtspResponse>> {
         headers,
         body,
     }))
+}
+
+fn random_uuid_string() -> String {
+    let bytes = rand::random::<[u8; 16]>();
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15],
+    )
 }
 
 fn parse_status_line(status_line: &str) -> Result<(u16, String)> {
